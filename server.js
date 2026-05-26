@@ -121,11 +121,19 @@ app.post("/api/chat", async (req, res) => {
     let lastError;
     for (const modelName of models) {
       try {
+        const controller = new AbortController();
+        // Set a 4-second timeout to quickly fallback if the model hangs
+        const timeoutId = setTimeout(() => controller.abort(new Error("Model connection timeout")), 4000);
+
         const result = await streamText({
           model: google(modelName),
           system: systemPrompt,
           messages,
+          abortSignal: controller.signal,
         });
+
+        // Clear the timeout if the stream successfully starts
+        clearTimeout(timeoutId);
 
         res.setHeader("Content-Type", "text/plain; charset=utf-8");
         res.setHeader("Transfer-Encoding", "chunked");
@@ -139,7 +147,7 @@ app.post("/api/chat", async (req, res) => {
         res.end();
         return;
       } catch (err) {
-        console.warn(`Model ${modelName} failed, trying next...`, err);
+        console.warn(`Model ${modelName} failed, trying next...`, err.message || err);
         lastError = err;
       }
     }
