@@ -121,33 +121,59 @@ app.post("/api/chat", async (req, res) => {
     let lastError;
     for (const modelName of models) {
       try {
-        const controller = new AbortController();
-        // Set a 4-second timeout to quickly fallback if the model hangs
-        const timeoutId = setTimeout(() => controller.abort(new Error("Model connection timeout")), 4000);
+        console.log(`Trying model: ${modelName}...`);
 
-        const result = await streamText({
-          model: google(modelName),
-          system: systemPrompt,
-          messages,
-          abortSignal: controller.signal,
-        });
+        // Race the ENTIRE stream attempt against a 4-second timeout.
+        // streamText() resolves instantly (returns a stream object),
+        // but the actual hang happens inside reader.read() waiting for
+        // the first chunk from a rate-limited API. So we must wrap
+        // everything — including the read loop — in the race.
+        const firstChunkOrTimeout = async () => {
+          const result = await streamText({
+            model: google(modelName),
+            system: systemPrompt,
+            messages,
+          });
 
-        // Clear the timeout if the stream successfully starts
-        clearTimeout(timeoutId);
+          const reader = result.textStream.getReader();
+          // Wait for the FIRST chunk — this is where the hang happens
+          const first = await reader.read();
+          return { reader, first };
+        };
 
+        const timeout = (ms) =>
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error(`Model ${modelName} timed out after ${ms}ms`)), ms)
+          );
+
+        // Race: first chunk must arrive within 4 seconds or we skip this model
+        const { reader, first } = await Promise.race([
+          firstChunkOrTimeout(),
+          timeout(4000),
+        ]);
+
+        // If we got here, the model is responding. Stream the rest.
         res.setHeader("Content-Type", "text/plain; charset=utf-8");
         res.setHeader("Transfer-Encoding", "chunked");
 
-        const reader = result.textStream.getReader();
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          res.write(value);
+        // Write the first chunk we already received
+        if (!first.done && first.value) {
+          res.write(first.value);
         }
+
+        // Continue reading the rest of the stream
+        if (!first.done) {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            res.write(value);
+          }
+        }
+
         res.end();
         return;
       } catch (err) {
-        console.warn(`Model ${modelName} failed, trying next...`, err.message || err);
+        console.warn(`Model ${modelName} failed: ${err.message || err}. Trying next...`);
         lastError = err;
       }
     }
